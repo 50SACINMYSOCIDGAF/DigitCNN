@@ -54,6 +54,31 @@ data ConvFilter = ConvFilter {
 
 instance NFData ConvFilter
 
+data Dimensions = Dimensions {
+    inputSize :: !Int,
+    conv1OutputSize :: !Int,
+    pool1OutputSize :: !Int,
+    conv2OutputSize :: !Int,
+    pool2OutputSize :: !Int,
+    fcLayerInputSize :: !Int  -- renamed from fcInputSize to avoid naming conflict
+} deriving (Show)
+
+calculateDimensions :: Int -> Int -> Int -> Dimensions
+calculateDimensions inputWidth filterSize poolSize = 
+    Dimensions {
+        inputSize = inputWidth * inputWidth,
+        conv1OutputSize = conv1Size * conv1Size * 6,  -- 6 filters
+        pool1OutputSize = pool1Size * pool1Size * 6,
+        conv2OutputSize = conv2Size * conv2Size * 16, -- 16 filters
+        pool2OutputSize = pool2Size * pool2Size * 16,
+        fcLayerInputSize = pool2Size * pool2Size * 16
+    }
+    where
+        conv1Size = inputWidth - filterSize + 1
+        pool1Size = conv1Size `div` poolSize
+        conv2Size = pool1Size - filterSize + 1
+        pool2Size = conv2Size `div` poolSize
+
 data CNN = CNN {
     convLayer1 :: !(V.Vector ConvFilter),
     convLayer2 :: !(V.Vector ConvFilter),
@@ -100,33 +125,53 @@ sigmoidDerivative !x = s * (1 - s)
   where !s = sigmoid x
 {-# INLINE sigmoidDerivative #-}
 
+-- Helper function to calculate convolution
+calculateConvolutionOutput :: Int -> Int -> Int
+calculateConvolutionOutput inputSize filterSize = inputSize - filterSize + 1
+
+-- Fixed convolve function with proper index handling
 convolve :: VU.Vector Double -> ConvFilter -> VU.Vector Double
-convolve !input !filter = VU.generate outputSize $ \i ->
-    let !x = i `div` outputWidth
-        !y = i `mod` outputWidth
-        !result = sum [((input VU.! (x * inputWidth + j)) * 
-                       (filterWeights filter V.! 0 VU.! j))
-                     | j <- [0..filterSize-1]
-                     ] + filterBias filter
+convolve !input !filter = VU.generate outputSize $ \idx ->
+    let !outY = idx `div` outputWidth
+        !outX = idx `mod` outputWidth
+        !result = sum [sum [ ((input VU.! (((outY + fy) * inputWidth) + (outX + fx))) * 
+                            (filterWeights filter V.! 0 VU.! (fy * filterSize + fx)))
+                          | fx <- [0..filterSize-1]
+                          , let inputIdx = ((outY + fy) * inputWidth) + (outX + fx)
+                          , inputIdx >= 0 && inputIdx < VU.length input
+                          ]
+                    | fy <- [0..filterSize-1]
+                    , (outY + fy) * inputWidth + outX < VU.length input
+                    ] + filterBias filter
     in sigmoid result
   where
-    !inputWidth = 28
-    !filterSize = 5
-    !outputWidth = inputWidth - filterSize + 1
+    !inputWidth = 28  -- MNIST image width
+    !filterSize = 5   -- 5x5 convolution filter
+    !outputWidth = calculateConvolutionOutput inputWidth filterSize
     !outputSize = outputWidth * outputWidth
 {-# INLINE convolve #-}
 
+-- Fixed maxPool function with proper index handling
 maxPool :: VU.Vector Double -> VU.Vector Double
-maxPool !input = VU.generate outputSize $ \i ->
-    let !x = i `div` outputWidth * 2
-        !y = i `mod` outputWidth * 2
-        !vals = [input VU.! (x * inputWidth + y),
-                input VU.! (x * inputWidth + y + 1),
-                input VU.! ((x + 1) * inputWidth + y),
-                input VU.! ((x + 1) * inputWidth + y + 1)]
-    in maximum vals
+maxPool !input = VU.generate outputSize $ \idx ->
+    let !outY = idx `div` outputWidth
+        !outX = idx `mod` outputWidth
+        !inY = outY * 2
+        !inX = outX * 2
+        !indices = [ inY * inputWidth + inX
+                  , inY * inputWidth + (inX + 1)
+                  , (inY + 1) * inputWidth + inX
+                  , (inY + 1) * inputWidth + (inX + 1)
+                  ]
+        !validVals = [ input VU.! i 
+                    | i <- indices
+                    , i >= 0 && i < VU.length input
+                    ]
+    in if null validVals 
+       then 0.0 
+       else maximum validVals
   where
-    !inputWidth = 24
+    !inputWidth = 24   -- Width after first convolution (28 - 5 + 1 = 24)
     !outputWidth = inputWidth `div` 2
     !outputSize = outputWidth * outputWidth
 {-# INLINE maxPool #-}
@@ -162,23 +207,37 @@ randomLayer !numNeurons !inputSize = do
         return $! Neuron ws b
     return $! Layer neurons (VU.replicate numNeurons 0.0)
 
+-- Fixed initCNN function
 initCNN :: IO CNN
 initCNN = do
-    !conv1 <- V.replicateM 6 (randomConvFilter 5)
-    !conv2 <- V.replicateM 16 (randomConvFilter 5)
-    !fc <- randomLayer 120 400
-    !output <- randomLayer 10 120
+    let dims = calculateDimensions 28 5 2  -- 28x28 input, 5x5 filter, 2x2 pooling
+        inputToFC = fcLayerInputSize dims  -- use renamed accessor
+    
+    !conv1 <- V.replicateM 6 (randomConvFilter 5)  -- 6 5x5 filters
+    !conv2 <- V.replicateM 16 (randomConvFilter 5) -- 16 5x5 filters
+    !fc <- randomLayer 120 inputToFC              -- Fully connected layer
+    !output <- randomLayer 10 120                 -- Output layer (10 digits)
     return $! CNN conv1 conv2 fc output
 
+-- Update forwardProp to handle dimensions properly
 forwardProp :: CNN -> VU.Vector Double -> (VU.Vector Double, CNN)
 forwardProp !cnn !input =
-    let !conv1Outputs = V.map (convolve input) (convLayer1 cnn)
+    let -- First convolution layer
+        !conv1Outputs = V.map (convolve input) (convLayer1 cnn)
         !conv1Output = VU.concat $ V.toList conv1Outputs
+        
+        -- First max pooling
         !pooled1 = maxPool conv1Output
+        
+        -- Second convolution layer
         !conv2Outputs = V.map (convolve pooled1) (convLayer2 cnn)
         !conv2Output = VU.concat $ V.toList conv2Outputs
+        
+        -- Second max pooling
         !pooled2 = maxPool conv2Output
-        !flattened = flatten pooled2
+        
+        -- Flatten and feed through fully connected layers
+        !flattened = pooled2  -- flatten is identity since we're already using 1D vectors
         !fcOutput = layerForward (fullyConnected cnn) flattened
         !outputResult = layerForward (outputLayer cnn) (activations fcOutput)
     in (activations outputResult,
@@ -186,51 +245,95 @@ forwardProp !cnn !input =
 
 backprop :: LearningRate -> CNN -> VU.Vector Double -> VU.Vector Double -> CNN
 backprop !lr !cnn !input !target =
-    let (!output, !forwardState) = forwardProp cnn input
+    let -- Forward pass
+        (!output, !forwardState) = forwardProp cnn input
+        
+        -- Calculate initial error
         !outputError = VU.zipWith (-) target output
+        
+        -- Backpropagate through layers
         (!outputGrads, !fcError) = layerBackprop lr (outputLayer forwardState) outputError
         (!fcGrads, !conv2Error) = layerBackprop lr (fullyConnected forwardState) fcError
         !conv2Grads = convLayerBackprop lr (convLayer2 forwardState) conv2Error
         !conv1Grads = convLayerBackprop lr (convLayer1 forwardState) conv2Error
-    in cnn {
-        convLayer1 = V.zipWith (updateFilter lr) (convLayer1 cnn) conv1Grads,
-        convLayer2 = V.zipWith (updateFilter lr) (convLayer2 cnn) conv2Grads,
-        fullyConnected = updateLayer lr (fullyConnected cnn) fcGrads,
-        outputLayer = updateLayer lr (outputLayer cnn) outputGrads
-    }
+        
+        -- Update layers
+        !newConv1 = V.zipWith (updateFilter lr) (convLayer1 cnn) conv1Grads
+        !newConv2 = V.zipWith (updateFilter lr) (convLayer2 cnn) conv2Grads
+        !newFC = updateLayer lr (fullyConnected cnn) fcGrads
+        !newOutput = updateLayer lr (outputLayer cnn) outputGrads
+        
+    in cnn { convLayer1 = newConv1
+           , convLayer2 = newConv2
+           , fullyConnected = newFC
+           , outputLayer = newOutput
+           }
 
+-- Fixed layerBackprop function with proper dimension handling
 layerBackprop :: LearningRate -> Layer -> VU.Vector Delta -> (V.Vector (VU.Vector Weight, Bias), VU.Vector Delta)
-layerBackprop !lr !layer !deltas =
-    let !gradients = V.zip 
-            (V.map (\n -> VU.map (* lr) (weights n)) (neurons layer))
-            (V.fromList $ replicate (V.length $ neurons layer) (lr * VU.sum deltas))
-        !nextDeltas = VU.generate (VU.length $ weights $ V.head $ neurons layer) $ \i ->
-            let contributions = V.map (\n -> (weights n VU.! i) * 
-                                           (deltas VU.! (V.length (neurons layer) - 1))) 
-                                    (neurons layer)
-            in V.sum contributions * sigmoidDerivative (activations layer VU.! i)
+layerBackprop !lr !layer !deltas = 
+    let !numNeurons = V.length $ neurons layer
+        !numInputs = VU.length $ weights $ V.head $ neurons layer
+        
+        -- Calculate gradients for each neuron
+        !gradients = V.generate numNeurons $ \i ->
+            let !neuron = neurons layer V.! i
+                !delta = if i < VU.length deltas then deltas VU.! i else 0.0
+                !weightGrads = VU.map (* (delta * lr)) (weights neuron)
+                !biasGrad = delta * lr
+            in (weightGrads, biasGrad)
+        
+        -- Calculate deltas for next layer
+        !nextDeltas = VU.generate numInputs $ \inputIdx ->
+            let !contributions = V.map 
+                    (\neuron -> 
+                        let !neuronIdx = V.length (neurons layer) - 1
+                            !delta = if neuronIdx < VU.length deltas 
+                                    then deltas VU.! neuronIdx 
+                                    else 0.0
+                        in (weights neuron VU.! inputIdx) * delta
+                    ) 
+                    (neurons layer)
+            in V.sum contributions
     in (gradients, nextDeltas)
-  where
-    computeGradients neuron delta =
-        let !weightGrads = VU.map (* delta) (weights neuron)
-            !biasGrad = delta * lr
-        in (weightGrads, biasGrad)
 
+-- Fixed convLayerBackprop function with proper dimension handling
 convLayerBackprop :: LearningRate -> V.Vector ConvFilter -> VU.Vector Delta -> V.Vector (VU.Vector Weight)
 convLayerBackprop !lr !filters !deltas =
-    V.map (\f -> VU.map (* lr) $ head $ V.toList $ filterWeights f) filters
+    let !numFilters = V.length filters
+        !filterSize = VU.length $ V.head $ filterWeights $ V.head filters
+    in V.generate numFilters $ \i ->
+        let !filter = filters V.! i
+            !gradients = VU.generate filterSize $ \j ->
+                let !delta = if i < VU.length deltas && j < VU.length deltas
+                            then deltas VU.! j
+                            else 0.0
+                in delta * lr
+        in gradients
 
+-- Fixed updateFilter function with dimension checks
 updateFilter :: LearningRate -> ConvFilter -> VU.Vector Weight -> ConvFilter
 updateFilter !lr !filter !grads =
-    filter { filterWeights = V.singleton $ VU.zipWith (-) (head $ V.toList $ filterWeights filter) grads }
+    let !currentWeights = V.head $ filterWeights filter
+        !newWeights = VU.generate (VU.length currentWeights) $ \i ->
+            let !grad = if i < VU.length grads then grads VU.! i else 0.0
+            in (currentWeights VU.! i) - grad
+    in filter { filterWeights = V.singleton newWeights }
 
+-- Fixed updateLayer function with safety checks
 updateLayer :: LearningRate -> Layer -> V.Vector (VU.Vector Weight, Bias) -> Layer
 updateLayer !lr !layer !grads =
-    layer { neurons = V.zipWith updateNeuron (neurons layer) grads }
-  where
-    updateNeuron neuron (weightGrads, biasGrad) =
-        neuron { weights = VU.zipWith (-) (weights neuron) weightGrads,
-                bias = bias neuron - biasGrad }
+    let !numNeurons = V.length $ neurons layer
+        !newNeurons = V.generate numNeurons $ \i ->
+            let !neuron = neurons layer V.! i
+                (!weightGrads, !biasGrad) = 
+                    if i < V.length grads 
+                    then grads V.! i
+                    else (VU.replicate (VU.length $ weights neuron) 0.0, 0.0)
+                !newWeights = VU.zipWith (-) (weights neuron) weightGrads
+                !newBias = bias neuron - biasGrad
+            in Neuron newWeights newBias
+    in layer { neurons = newNeurons }
 
 loadMNISTData :: FilePath -> FilePath -> IO MNISTData
 loadMNISTData !imagesPath !labelsPath = do
@@ -261,6 +364,17 @@ parseIDXLabels !bs =
 oneHotEncode :: Int -> VU.Vector Double
 oneHotEncode !label = VU.generate 10 $ \i -> if i == label then 1.0 else 0.0
 
+monitorTraining :: CNN -> VU.Vector Double -> VU.Vector Double -> IO ()
+monitorTraining cnn input target = do
+    let (output, _) = forwardProp cnn input
+    putStrLn $ "Target: " ++ show (VU.toList target)
+    putStrLn $ "Output: " ++ show (VU.toList output)
+    putStrLn $ "Error: " ++ show (VU.sum $ VU.zipWith (-) target output)
+    putStrLn $ "Output Layer Neurons: " ++ show (V.length $ neurons $ outputLayer cnn)
+    putStrLn $ "FC Layer Neurons: " ++ show (V.length $ neurons $ fullyConnected cnn)
+    putStrLn $ "Conv2 Filters: " ++ show (V.length $ convLayer2 cnn)
+    putStrLn $ "Conv1 Filters: " ++ show (V.length $ convLayer1 cnn)
+
 trainBatch :: LearningRate -> CNN -> [(VU.Vector Double, VU.Vector Double)] -> IO CNN
 trainBatch !lr !cnn !batch = do
     return $! foldl' (\acc (input, target) ->
@@ -278,23 +392,28 @@ train !lr !epochs !batchSize !initialCNN !mnistData = do
         printf "["
         hFlush stdout
         
+        -- Add monitoring for first sample of first batch
+        when (epoch == 1) $ do
+            let (firstInput, firstTarget) = V.head trainingPairs
+            monitorTraining cnn firstInput firstTarget
+        
         let !batches = [V.toList $ V.slice (i * batchSize) batchSize trainingPairs 
                       | i <- [0..numBatches-1]]
         
-        foldM (\cnn' (batchNum, batch) -> do
-                when (batchNum `mod` (numBatches `div` 50) == 0) $ do
-                    let progress = ((epoch - 1) * numBatches + batchNum) * 100 `div` totalSteps
-                    printf "\rEpoch %d/%d [%s%s] %d%%" 
-                        epoch epochs 
-                        (replicate (progress `div` 2) '=')
-                        (replicate (50 - (progress `div` 2)) ' ')
-                        progress
-                    hFlush stdout
-                
-                !trainedCNN <- trainBatch lr cnn' batch
-                return $! trainedCNN
-            ) cnn (zip [1..] batches)
-        ) initialCNN [1..epochs]
+        trainedEpochCNN <- foldM (\cnn' (batchNum, batch) -> do
+            when (batchNum `mod` (numBatches `div` 50) == 0) $ do
+                let progress = ((epoch - 1) * numBatches + batchNum) * 100 `div` totalSteps
+                printf "\rEpoch %d/%d [%s%s] %d%%" 
+                    epoch epochs 
+                    (replicate (progress `div` 2) '=')
+                    (replicate (50 - (progress `div` 2)) ' ')
+                    progress
+                hFlush stdout
+            
+            !trainedCNN <- trainBatch lr cnn' batch
+            return $! trainedCNN) cnn (zip [1..] batches)
+            
+        return $! trainedEpochCNN) initialCNN [1..epochs]
 
 saveCNN :: FilePath -> CNN -> IO ()
 saveCNN path cnn = BSL.writeFile path (Binary.encode cnn)
@@ -339,7 +458,6 @@ interactiveMode !cnn = do
                 putStr "\n"
                 hFlush stdout
 
-main :: IO ()
 main = do
     args <- getArgs
     case args of
@@ -348,8 +466,17 @@ main = do
             !mnistData <- loadMNISTData "data/train-images.idx3-ubyte" 
                                       "data/train-labels.idx1-ubyte"
             
+            -- Add debug information
+            putStrLn $ "First image dimensions: " ++ show (VU.length $ V.head $ images mnistData)
+            putStrLn $ "Number of training samples: " ++ show (V.length $ images mnistData)
+            
             putStrLn "Initializing CNN..."
             !cnn <- initCNN
+            
+            -- Test first forward pass
+            let firstImage = V.head $ images mnistData
+                (output, _) = forwardProp cnn firstImage
+            putStrLn $ "First forward pass output dimensions: " ++ show (VU.length output)
             
             putStrLn "Starting training..."
             !trainedCNN <- train 0.005 8 64 cnn mnistData
