@@ -1,0 +1,30 @@
+cabal-version:      3.0
+name:               digit-cnn
+version:            0.1.0.0
+license:            MIT
+author:             Noah R
+maintainer:         noah@noah.jp.net
+
+executable digit-cnn
+    main-is:          DigitCNN.hs
+    build-depends:    base ^>=4.17.2.1
+                    , vector
+                    , random
+                    , bytestring
+                    , binary
+                    , terminal-progress-bar
+                    , directory
+                    , aeson
+                    , text
+                    , transformers
+                    , deepseq
+                    , async
+                    , containers
+                    , primitive
+    hs-source-dirs:   src
+    default-language: Haskell2010
+    ghc-options:      -Wall
+                     -O2
+                     -threaded
+                     -rtsopts
+                     -with-rtsopts=-N
