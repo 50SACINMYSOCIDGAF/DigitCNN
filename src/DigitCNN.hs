@@ -25,6 +25,10 @@ import Control.Concurrent
 import System.Environment (getArgs)
 import Data.String (fromString)
 import qualified Data.Vector.Generic as VG
+import System.Directory (doesFileExist, getCurrentDirectory)
+import System.IO.Unsafe (unsafePerformIO)
+import Data.Function (fix)
+import Control.Monad (when)
 
 
 type Weight = Double
@@ -88,28 +92,58 @@ data CNN = CNN {
 
 instance NFData CNN
 
+-- Updated these instances with more precise serialization
 instance Binary.Binary Neuron where
-    put (Neuron w b) = Binary.put (VU.toList w) >> Binary.put b
-    get = Neuron <$> (VU.fromList <$> Binary.get) <*> Binary.get
+    put (Neuron w b) = do
+        Binary.put (VU.length w :: Int)
+        Binary.put (VU.toList w)
+        Binary.put b
+    get = do
+        len <- Binary.get :: Get Int
+        ws <- VU.fromList <$> Binary.get
+        b <- Binary.get
+        return $! Neuron ws b
 
 instance Binary.Binary Layer where
-    put (Layer n a) = Binary.put (V.toList n) >> Binary.put (VU.toList a)
-    get = Layer <$> (V.fromList <$> Binary.get) <*> (VU.fromList <$> Binary.get)
+    put (Layer n a) = do
+        Binary.put (V.length n :: Int)
+        Binary.put (V.toList n)
+        Binary.put (VU.length a :: Int)
+        Binary.put (VU.toList a)
+    get = do
+        nLen <- Binary.get :: Get Int
+        ns <- V.fromList <$> Binary.get
+        aLen <- Binary.get :: Get Int
+        as <- VU.fromList <$> Binary.get
+        return $! Layer ns as
 
 instance Binary.Binary ConvFilter where
-    put (ConvFilter w b) = Binary.put (map VU.toList $ V.toList w) >> Binary.put b
-    get = ConvFilter <$> (V.fromList . map VU.fromList <$> Binary.get) <*> Binary.get
+    put (ConvFilter w b) = do
+        Binary.put (V.length w :: Int)
+        Binary.put (map VU.toList $ V.toList w)
+        Binary.put b
+    get = do
+        wLen <- Binary.get :: Get Int
+        ws <- V.fromList . map VU.fromList <$> Binary.get
+        b <- Binary.get
+        return $! ConvFilter ws b
 
 instance Binary.Binary CNN where
     put (CNN c1 c2 fc out) = do
+        Binary.put (V.length c1 :: Int)
         Binary.put (V.toList c1)
+        Binary.put (V.length c2 :: Int)
         Binary.put (V.toList c2)
         Binary.put fc
         Binary.put out
-    get = CNN <$> (V.fromList <$> Binary.get) 
-             <*> (V.fromList <$> Binary.get)
-             <*> Binary.get
-             <*> Binary.get
+    get = do
+        c1Len <- Binary.get :: Get Int
+        c1 <- V.fromList <$> Binary.get
+        c2Len <- Binary.get :: Get Int
+        c2 <- V.fromList <$> Binary.get
+        fc <- Binary.get
+        out <- Binary.get
+        return $! CNN c1 c2 fc out
 
 data MNISTData = MNISTData {
     images :: !(V.Vector (VU.Vector Double)),
@@ -117,7 +151,11 @@ data MNISTData = MNISTData {
 }
 
 sigmoid :: Double -> Double
-sigmoid !x = 1 / (1 + exp (-x))
+sigmoid !x 
+    | x > 100 = 1.0  -- Prevent exp overflow
+    | x < -100 = 0.0
+    | isNaN x = 0.5  -- Provide safe default
+    | otherwise = 1 / (1 + exp (-x))
 {-# INLINE sigmoid #-}
 
 sigmoidDerivative :: Double -> Double
@@ -131,7 +169,7 @@ calculateConvolutionOutput inputSize filterSize = inputSize - filterSize + 1
 
 -- Fixed convolve function with proper index handling
 convolve :: VU.Vector Double -> ConvFilter -> VU.Vector Double
-convolve !input !filter = VU.generate outputSize $ \idx ->
+convolve !input !filter = VU.generate outputSize $ \idx -> unsafePerformIO $ do
     let !outY = idx `div` outputWidth
         !outX = idx `mod` outputWidth
         !result = sum [sum [ ((input VU.! (((outY + fy) * inputWidth) + (outX + fx))) * 
@@ -143,7 +181,13 @@ convolve !input !filter = VU.generate outputSize $ \idx ->
                     | fy <- [0..filterSize-1]
                     , (outY + fy) * inputWidth + outX < VU.length input
                     ] + filterBias filter
-    in sigmoid result
+        !sigResult = sigmoid result
+    
+    when (isNaN sigResult || isInfinite sigResult) $
+        putStrLn $ "Warning: Invalid result at " ++ show (outX, outY) ++ 
+                   " raw: " ++ show result ++ " sigmoid: " ++ show sigResult
+    
+    return $ if isNaN sigResult || isInfinite sigResult then 0.0 else sigResult
   where
     !inputWidth = 28  -- MNIST image width
     !filterSize = 5   -- 5x5 convolution filter
@@ -190,7 +234,7 @@ layerForward !layer !input = layer { activations = newActivations }
 {-# INLINE layerForward #-}
 
 randomWeight :: IO Double
-randomWeight = randomRIO (-0.1, 0.1)
+randomWeight = randomRIO (-0.05, 0.05) 
 {-# INLINE randomWeight #-}
 
 randomConvFilter :: Int -> IO ConvFilter
@@ -311,16 +355,25 @@ convLayerBackprop !lr !filters !deltas =
                 in delta * lr
         in gradients
 
--- Fixed updateFilter function with dimension checks
+clipValue :: Double -> Double
+clipValue x
+    | isNaN x = 0.0
+    | isInfinite x = signum x * 10.0
+    | abs x > 10.0 = signum x * 10.0
+    | otherwise = x
+{-# INLINE clipValue #-}
+
+-- Modify updateFilter to use clipping
 updateFilter :: LearningRate -> ConvFilter -> VU.Vector Weight -> ConvFilter
 updateFilter !lr !filter !grads =
     let !currentWeights = V.head $ filterWeights filter
         !newWeights = VU.generate (VU.length currentWeights) $ \i ->
             let !grad = if i < VU.length grads then grads VU.! i else 0.0
-            in (currentWeights VU.! i) - grad
+                !newWeight = (currentWeights VU.! i) - grad
+            in clipValue newWeight
     in filter { filterWeights = V.singleton newWeights }
 
--- Fixed updateLayer function with safety checks
+-- Modify updateLayer to use clipping
 updateLayer :: LearningRate -> Layer -> V.Vector (VU.Vector Weight, Bias) -> Layer
 updateLayer !lr !layer !grads =
     let !numNeurons = V.length $ neurons layer
@@ -330,8 +383,9 @@ updateLayer !lr !layer !grads =
                     if i < V.length grads 
                     then grads V.! i
                     else (VU.replicate (VU.length $ weights neuron) 0.0, 0.0)
-                !newWeights = VU.zipWith (-) (weights neuron) weightGrads
-                !newBias = bias neuron - biasGrad
+                !newWeights = VU.map clipValue $ 
+                    VU.zipWith (-) (weights neuron) weightGrads
+                !newBias = clipValue $ bias neuron - biasGrad
             in Neuron newWeights newBias
     in layer { neurons = newNeurons }
 
@@ -416,46 +470,122 @@ train !lr !epochs !batchSize !initialCNN !mnistData = do
         return $! trainedEpochCNN) initialCNN [1..epochs]
 
 saveCNN :: FilePath -> CNN -> IO ()
-saveCNN path cnn = BSL.writeFile path (Binary.encode cnn)
+saveCNN path cnn = do
+    let encoded = Binary.encode cnn
+    BSL.writeFile path encoded
+    putStrLn $ "Model saved successfully to " ++ path
+    putStrLn $ "Model size: " ++ show (BSL.length encoded) ++ " bytes"
 
-loadCNN :: FilePath -> IO CNN
+loadCNN :: FilePath -> IO (Either String CNN)
 loadCNN path = do
-    content <- BSL.readFile path
-    case Binary.decode content of
-        Left err -> error $ "Failed to load model: " ++ err
-        Right cnn -> return cnn
+    currentDir <- getCurrentDirectory
+    putStrLn $ "Current directory: " ++ currentDir
+    putStrLn $ "Looking for model at: " ++ path
+    exists <- doesFileExist path
+    if not exists
+        then return $ Left $ "Model file not found: " ++ path
+        else do
+            content <- BSL.readFile path
+            case Binary.decodeOrFail content of
+                Left (_, _, err) -> return $ Left $ "Failed to decode model: " ++ err
+                Right (_, _, cnn) -> return $ Right cnn
 
+-- Helper function to ensure numeric validity
+validateVec :: String -> VU.Vector Double -> VU.Vector Double
+validateVec name vec = 
+    let !maxVal = VU.maximum vec
+        !minVal = VU.minimum vec
+        !hasNaN = VU.any isNaN vec
+        !hasInf = VU.any isInfinite vec
+        !validVec = VU.map (\x -> if isNaN x || isInfinite x then 0.0 else x) vec
+    in unsafePerformIO $ do
+        when hasNaN $ putStrLn $ name ++ ": Contains NaN values"
+        when hasInf $ putStrLn $ name ++ ": Contains Infinite values"
+        putStrLn $ name ++ " range: [" ++ show minVal ++ ", " ++ show maxVal ++ "]"
+        return validVec
+
+-- Modified processImage to validate intermediate results
 processImage :: VU.Vector Double -> CNN -> (VU.Vector Double, VU.Vector Double)
-processImage !input !cnn =
+processImage !input !cnn = unsafePerformIO $ do
+    putStrLn $ "Input size: " ++ show (VU.length input)
+    putStrLn $ "Input range: [" ++ show (VU.minimum input) ++ ", " ++ show (VU.maximum input) ++ "]"
+    
+    -- First convolution layer
     let !conv1Outputs = V.map (convolve input) (convLayer1 cnn)
-        !conv1Output = VU.concat $ V.toList conv1Outputs
-        !pooled1 = maxPool conv1Output
-        !conv2Outputs = V.map (convolve pooled1) (convLayer2 cnn)
-        !conv2Output = VU.concat $ V.toList conv2Outputs
-        !pooled2 = maxPool conv2Output
-        (!final, _) = forwardProp cnn input
-    in (conv1Output, final)
+        !conv1Output = validateVec "Conv1" $ VU.concat $ V.toList conv1Outputs
+    
+    putStrLn $ "Conv1 size: " ++ show (VU.length conv1Output)
+    
+    -- First max pooling
+    let !pooled1 = validateVec "Pool1" $ maxPool conv1Output
+    
+    putStrLn $ "Pool1 size: " ++ show (VU.length pooled1)
+    
+    -- Second convolution layer
+    let !conv2Outputs = V.map (convolve pooled1) (convLayer2 cnn)
+        !conv2Output = validateVec "Conv2" $ VU.concat $ V.toList conv2Outputs
+    
+    putStrLn $ "Conv2 size: " ++ show (VU.length conv2Output)
+    
+    -- Second max pooling
+    let !pooled2 = validateVec "Pool2" $ maxPool conv2Output
+    
+    putStrLn $ "Pool2 size: " ++ show (VU.length pooled2)
+    
+    -- Final predictions
+    let (!predictions, _) = forwardProp cnn input
+        !validPredictions = validateVec "Predictions" predictions
+    
+    -- Force evaluation and return
+    return $! (conv1Output, validPredictions)
 
+-- Modified interactiveMode to ensure proper JSON handling
+interactiveMode :: CNN -> IO ()
 interactiveMode !cnn = do
     hSetBuffering stdin LineBuffering
     hSetBuffering stdout LineBuffering
     
+    putStrLn "Interactive mode started... waiting for input"
+    hFlush stdout
+    
     forever $ do
+        putStrLn "Waiting for input..."
+        hFlush stdout
+        
         input <- getLine
+        putStrLn $ "Received input (first 100 chars): " ++ take 100 input
+        hFlush stdout
+        
         case Aeson.decode (BSL.pack input) of
             Nothing -> do
-                putStrLn "Error: Invalid input format"
+                putStrLn $ "Error: Invalid JSON input format: " ++ take 100 input
                 hFlush stdout
             
             Just imgData -> do
+                putStrLn "Successfully decoded input array"
+                putStrLn $ "Input array length: " ++ show (VU.length imgData)
+                hFlush stdout
+                
                 let (!layerOutput, !predictions) = processImage imgData cnn
-                    result = object [
-                        fromString "layer_output" .= VU.toList layerOutput,
-                        fromString "predictions" .= VU.toList predictions
+                putStrLn $ "Layer output size: " ++ show (VU.length layerOutput)
+                putStrLn $ "Predictions size: " ++ show (VU.length predictions)
+                putStrLn $ "Sample predictions: " ++ show (take 5 $ VU.toList predictions)
+                hFlush stdout
+                
+                let result = object
+                        [ fromString "layer_output" .= VU.toList layerOutput
+                        , fromString "predictions" .= VU.toList predictions
                         ]
                 
-                BSL.putStr (Aeson.encode result)
+                putStrLn "Encoding response..."
+                let encoded = Aeson.encode result
+                putStrLn $ "Response size: " ++ show (BSL.length encoded) ++ " bytes"
+                
+                BSL.putStr encoded
                 putStr "\n"
+                hFlush stdout
+                
+                putStrLn "Response sent"
                 hFlush stdout
 
 main = do
@@ -479,17 +609,14 @@ main = do
             putStrLn $ "First forward pass output dimensions: " ++ show (VU.length output)
             
             putStrLn "Starting training..."
-            !trainedCNN <- train 0.005 8 64 cnn mnistData
+            !trainedCNN <- train 0.001 8 64 cnn mnistData
             
             putStrLn "\nSaving model..."
             saveCNN "trained_model.cnn" trainedCNN
-            
             putStrLn "Training complete!"
         
         [] -> do
-            modelExists <- doesFileExist "trained_model.cnn"
-            if not modelExists 
-                then putStrLn "Error: Model file not found!"
-                else do
-                    !cnn <- loadCNN "trained_model.cnn"
-                    interactiveMode cnn
+            modelResult <- loadCNN "trained_model.cnn"
+            case modelResult of
+                Left err -> putStrLn $ "Error: " ++ err
+                Right cnn -> interactiveMode cnn
